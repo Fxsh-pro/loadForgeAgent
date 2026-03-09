@@ -35,6 +35,10 @@ type Runner struct {
 
 	stopCh chan struct{}
 	doneCh chan struct{}
+
+	// failureReason is set when the runner aborts due to a fatal error.
+	// Empty string means normal completion or stop.
+	failureReason string
 }
 
 func NewRunner(req StartTaskRequest, collector *metrics.Collector) *Runner {
@@ -80,12 +84,29 @@ func (r *Runner) Done() <-chan struct{} {
 	return r.doneCh
 }
 
+// FailureReason returns the reason the run failed, or "" if it completed/stopped normally.
+// Only valid after Done() is closed.
+func (r *Runner) FailureReason() string {
+	return r.failureReason
+}
+
 func (r *Runner) runPhases() {
 	defer func() {
+		// Catch any unhandled panic and record it as the failure reason.
+		if rec := recover(); rec != nil {
+			r.failureReason = fmt.Sprintf("panic: %v", rec)
+			log.Printf("[Run %s] PANIC: %v", r.runID, rec)
+		}
 		r.scaleToZero()
 		log.Printf("[Run %s] all VUs stopped", r.runID)
 		close(r.doneCh)
 	}()
+
+	if len(r.phases) == 0 {
+		r.failureReason = "no phases defined"
+		log.Printf("[Run %s] ERROR: %s", r.runID, r.failureReason)
+		return
+	}
 
 	log.Printf("[Run %s] starting — %d phase(s)", r.runID, len(r.phases))
 
@@ -95,6 +116,12 @@ func (r *Runner) runPhases() {
 			log.Printf("[Run %s] stop signal received during phase %d — aborting", r.runID, i+1)
 			return
 		default:
+		}
+
+		if phase.DurationSeconds <= 0 {
+			r.failureReason = fmt.Sprintf("phase %d has invalid durationSeconds=%d", i+1, phase.DurationSeconds)
+			log.Printf("[Run %s] ERROR: %s", r.runID, r.failureReason)
+			return
 		}
 
 		log.Printf("[Run %s] phase %d/%d — targetVUs=%d duration=%ds",

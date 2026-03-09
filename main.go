@@ -6,69 +6,17 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/mackerelio/go-osstat/cpu"
+	"github.com/mackerelio/go-osstat/memory"
 
 	"github.com/loadforge/agent/api"
 	"github.com/loadforge/agent/client"
 	"github.com/loadforge/agent/config"
 	"github.com/loadforge/agent/metrics"
 )
-
-func getCPUPercent() float32 {
-	data, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return 0
-	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) == 0 {
-		return 0
-	}
-	fields := strings.Fields(lines[0])
-	if len(fields) < 5 {
-		return 0
-	}
-	vals := make([]float64, len(fields)-1)
-	for i, f := range fields[1:] {
-		vals[i], _ = strconv.ParseFloat(f, 64)
-	}
-	idle := vals[3]
-	total := 0.0
-	for _, v := range vals {
-		total += v
-	}
-	if total == 0 {
-		return 0
-	}
-	return float32((1 - idle/total) * 100)
-}
-
-func getRAMPercent() float32 {
-	data, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	var total, available float64
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		val, _ := strconv.ParseFloat(fields[1], 64)
-		switch fields[0] {
-		case "MemTotal:":
-			total = val
-		case "MemAvailable:":
-			available = val
-		}
-	}
-	if total == 0 {
-		return 0
-	}
-	return float32((1 - available/total) * 100)
-}
 
 func main() {
 	cfg, err := config.Load()
@@ -89,6 +37,10 @@ func main() {
 	}
 	cfg.AgentID = agentID
 	log.Printf("registered successfully (url=%s id=%s)", cfg.AgentURL, cfg.AgentID)
+
+	// On startup, check if there were in-flight runs from a previous process.
+	// If so, notify master they failed (the agent lost all state on restart).
+	recoverStaleRuns(cfg, masterClient)
 
 	store := api.NewRunStore()
 	collector := metrics.NewCollector()
@@ -118,12 +70,22 @@ func main() {
 		}
 	}
 
+	failer := func(runID string, reason string) {
+		log.Printf("[Run %s] fatal failure — notifying master: %s", runID, reason)
+		if err := masterClient.NotifyFailed(runID, cfg.AgentID, cfg.AgentToken, reason); err != nil {
+			log.Printf("[Run %s] notify failed error: %v", runID, err)
+		} else {
+			log.Printf("[Run %s] master acknowledged failure", runID)
+		}
+	}
+
 	srv := api.NewServer(
 		fmt.Sprintf(":%s", cfg.AgentPort),
 		store,
 		collector,
 		reporter,
 		completer,
+		failer,
 	)
 
 	go func() {
@@ -146,9 +108,6 @@ func main() {
 	}
 }
 
-// resolveAgentID registers with the master (or reconnects) and returns the agent UUID.
-// On first boot: calls Register, gets UUID, persists it to .agent_id.
-// On restart: loads UUID from .agent_id, then re-registers (master upserts).
 func resolveAgentID(cfg *config.Config, masterClient *client.MasterClient, hostname string) (string, error) {
 	log.Printf("registering with master at %s", cfg.MasterURL)
 
@@ -159,8 +118,6 @@ func resolveAgentID(cfg *config.Config, masterClient *client.MasterClient, hostn
 		URL:      cfg.AgentURL,
 	})
 	if err != nil {
-		// Registration failed — try to fall back to persisted ID so heartbeat
-		// can still work if the master is temporarily unreachable on startup.
 		if saved, ferr := config.LoadAgentID(); ferr == nil && saved != "" {
 			log.Printf("warning: registration failed (%v), using persisted agent id %s", err, saved)
 			return saved, nil
@@ -176,17 +133,78 @@ func resolveAgentID(cfg *config.Config, masterClient *client.MasterClient, hostn
 }
 
 func heartbeatLoop(cfg *config.Config, masterClient *client.MasterClient, store *api.RunStore) {
-	ticker := time.NewTicker(10 * time.Second)
+	const interval = 10 * time.Second
+
+	// Take an initial CPU snapshot so the first delta is available immediately.
+	prevCPU, _ := cpu.Get()
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
+		cpuUsage, newSnapshot := getCPUPercent(prevCPU)
+		prevCPU = newSnapshot
+		ramUsage := getRAMPercent()
+		currentVUs := store.TotalActiveVUs()
+
+		log.Printf("[Heartbeat] cpu=%.1f%% ram=%.1f%% vus=%d", cpuUsage, ramUsage, currentVUs)
+
 		if err := masterClient.Heartbeat(client.AgentHeartbeatRequest{
 			AgentToken: cfg.AgentToken,
-			CPUUsage:   getCPUPercent(),
-			RAMUsage:   getRAMPercent(),
-			CurrentVUs: store.TotalActiveVUs(),
+			CPUUsage:   cpuUsage,
+			RAMUsage:   ramUsage,
+			CurrentVUs: currentVUs,
 		}); err != nil {
-			log.Printf("heartbeat failed: %v", err)
+			log.Printf("[Heartbeat] failed: %v", err)
 		}
 	}
+}
+
+// getCPUPercent computes CPU usage % as a delta between two snapshots.
+// Returns the percentage and the current snapshot for the next call.
+func getCPUPercent(prev *cpu.Stats) (float32, *cpu.Stats) {
+	curr, err := cpu.Get()
+	if err != nil || prev == nil {
+		return 0, curr
+	}
+
+	totalDelta := float64(curr.Total - prev.Total)
+	if totalDelta <= 0 {
+		return 0, curr
+	}
+
+	idleDelta := float64(curr.Idle - prev.Idle)
+	used := (1 - idleDelta/totalDelta) * 100
+	return float32(used), curr
+}
+
+func getRAMPercent() float32 {
+	mem, err := memory.Get()
+	if err != nil || mem.Total == 0 {
+		return 0
+	}
+	used := float64(mem.Used) / float64(mem.Total) * 100
+	return float32(used)
+}
+
+// recoverStaleRuns checks for runs that were active when the agent last exited.
+// Since all in-memory state is lost on restart, these runs are dead — notify master.
+func recoverStaleRuns(cfg *config.Config, masterClient *client.MasterClient) {
+	staleRunIDs := config.LoadActiveRuns()
+	if len(staleRunIDs) == 0 {
+		return
+	}
+
+	log.Printf("[Recovery] found %d stale run(s) from previous process: %v", len(staleRunIDs), staleRunIDs)
+
+	for _, runID := range staleRunIDs {
+		err := masterClient.NotifyFailed(runID, cfg.AgentID, cfg.AgentToken, "agent restarted — in-flight run lost")
+		if err != nil {
+			log.Printf("[Recovery] failed to notify master about stale run %s: %v", runID, err)
+		} else {
+			log.Printf("[Recovery] notified master that run %s failed due to restart", runID)
+		}
+	}
+
+	config.ClearActiveRuns()
 }

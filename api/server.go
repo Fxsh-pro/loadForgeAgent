@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/loadforge/agent/config"
 	"github.com/loadforge/agent/engine"
 	"github.com/loadforge/agent/metrics"
 )
@@ -32,6 +33,7 @@ func (s *RunStore) Set(runID string, r *engine.Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.runners[runID] = r
+	s.persistRunIDs()
 }
 
 func (s *RunStore) Get(runID string) (*engine.Runner, bool) {
@@ -45,6 +47,21 @@ func (s *RunStore) Delete(runID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.runners, runID)
+	s.persistRunIDs()
+}
+
+// persistRunIDs writes the current set of active run IDs to disk.
+// Must be called with s.mu held.
+func (s *RunStore) persistRunIDs() {
+	ids := make([]string, 0, len(s.runners))
+	for id := range s.runners {
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		config.ClearActiveRuns()
+	} else {
+		_ = config.SaveActiveRuns(ids)
+	}
 }
 
 // TotalActiveVUs returns the sum of active VUs across all running tasks.
@@ -64,20 +81,25 @@ type MetricsReporter func(runID string, snap metrics.Snapshot)
 // RunCompleter is called once when a run finishes all its phases naturally.
 type RunCompleter func(runID string)
 
+// RunFailer is called when a run aborts due to a fatal runtime error.
+type RunFailer func(runID string, reason string)
+
 type Server struct {
 	store     *RunStore
 	reporter  MetricsReporter
 	completer RunCompleter
+	failer    RunFailer
 	collector *metrics.Collector
 	httpSrv   *http.Server
 }
 
-func NewServer(addr string, store *RunStore, collector *metrics.Collector, reporter MetricsReporter, completer RunCompleter) *Server {
+func NewServer(addr string, store *RunStore, collector *metrics.Collector, reporter MetricsReporter, completer RunCompleter, failer RunFailer) *Server {
 	s := &Server{
 		store:     store,
 		collector: collector,
 		reporter:  reporter,
 		completer: completer,
+		failer:    failer,
 	}
 
 	r := chi.NewRouter()
@@ -173,8 +195,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 // metricsLoop flushes metrics every 5 seconds until the run completes.
-// When the runner's Done channel closes (phases finished naturally), it also
-// calls the completer to notify the master.
+// On natural completion calls completer; on fatal failure calls failer.
 func (s *Server) metricsLoop(runner *engine.Runner) {
 	const interval = 5 * time.Second
 	ticker := time.NewTicker(interval)
@@ -183,16 +204,22 @@ func (s *Server) metricsLoop(runner *engine.Runner) {
 	for {
 		select {
 		case <-runner.Done():
-			// Final metrics flush
 			snap := s.collector.Flush(interval.Seconds())
 			if s.reporter != nil {
 				s.reporter(runner.RunID(), snap)
 			}
 			s.store.Delete(runner.RunID())
-			log.Printf("[Run %s] finished — all phases complete", runner.RunID())
-			// Notify master that this agent is done
-			if s.completer != nil {
-				s.completer(runner.RunID())
+
+			if reason := runner.FailureReason(); reason != "" {
+				log.Printf("[Run %s] FAILED: %s", runner.RunID(), reason)
+				if s.failer != nil {
+					s.failer(runner.RunID(), reason)
+				}
+			} else {
+				log.Printf("[Run %s] finished — all phases complete", runner.RunID())
+				if s.completer != nil {
+					s.completer(runner.RunID())
+				}
 			}
 			return
 

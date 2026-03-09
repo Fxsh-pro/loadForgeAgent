@@ -97,11 +97,22 @@ type agentRunCompleteRequest struct {
 	AgentToken string `json:"agentToken"`
 }
 
-// NotifyComplete tells the master this agent has finished all phases of the run.
-// The master will mark test_run_agents.status = FINISHED and agents.status = IDLE.
+type agentRunFailRequest struct {
+	AgentToken string `json:"agentToken"`
+	Reason     string `json:"reason"`
+}
+
+// NotifyComplete tells the master this agent has finished all phases of the run normally.
 func (c *MasterClient) NotifyComplete(runID string, agentID string, agentToken string) error {
 	url := fmt.Sprintf("%s/api/runs/%s/complete?agentId=%s", c.masterURL, runID, agentID)
 	return c.postJSON(url, agentRunCompleteRequest{AgentToken: agentToken})
+}
+
+// NotifyFailed tells the master this agent encountered a fatal error during the run.
+// The master will mark the run and this agent's slot as FAILED with the given reason.
+func (c *MasterClient) NotifyFailed(runID string, agentID string, agentToken string, reason string) error {
+	url := fmt.Sprintf("%s/api/runs/%s/fail?agentId=%s", c.masterURL, runID, agentID)
+	return c.postJSON(url, agentRunFailRequest{AgentToken: agentToken, Reason: reason})
 }
 
 func (c *MasterClient) postJSON(url string, payload any) error {

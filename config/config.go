@@ -8,6 +8,7 @@ import (
 
 const tokenFile = ".agent_token"
 const idFile = ".agent_id"
+const activeRunsFile = ".active_runs"
 
 type Config struct {
 	MasterURL  string
@@ -110,4 +111,32 @@ func LoadAgentID() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(data)), nil
+}
+
+// SaveActiveRuns writes the set of currently active run IDs to disk.
+func SaveActiveRuns(runIDs []string) error {
+	content := strings.Join(runIDs, "\n")
+	return os.WriteFile(activeRunsFile, []byte(content), 0600)
+}
+
+// LoadActiveRuns reads previously persisted active run IDs from disk.
+// Returns an empty slice if the file does not exist.
+func LoadActiveRuns() []string {
+	data, err := os.ReadFile(activeRunsFile)
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			ids = append(ids, line)
+		}
+	}
+	return ids
+}
+
+// ClearActiveRuns removes the active runs file.
+func ClearActiveRuns() {
+	os.Remove(activeRunsFile)
 }
