@@ -38,10 +38,6 @@ func main() {
 	cfg.AgentID = agentID
 	log.Printf("registered successfully (url=%s id=%s)", cfg.AgentURL, cfg.AgentID)
 
-	// On startup, check if there were in-flight runs from a previous process.
-	// If so, notify master they failed (the agent lost all state on restart).
-	recoverStaleRuns(cfg, masterClient)
-
 	store := api.NewRunStore()
 	collector := metrics.NewCollector()
 
@@ -147,13 +143,19 @@ func heartbeatLoop(cfg *config.Config, masterClient *client.MasterClient, store 
 		ramUsage := getRAMPercent()
 		currentVUs := store.TotalActiveVUs()
 
-		log.Printf("[Heartbeat] cpu=%.1f%% ram=%.1f%% vus=%d", cpuUsage, ramUsage, currentVUs)
+		runningIDs := store.RunningIDs()
+		if len(runningIDs) > 0 {
+			log.Printf("[Heartbeat] cpu=%.1f%% ram=%.1f%% vus=%d runs=%v", cpuUsage, ramUsage, currentVUs, runningIDs)
+		} else {
+			log.Printf("[Heartbeat] cpu=%.1f%% ram=%.1f%% vus=%d runs=[]", cpuUsage, ramUsage, currentVUs)
+		}
 
 		if err := masterClient.Heartbeat(client.AgentHeartbeatRequest{
-			AgentToken: cfg.AgentToken,
-			CPUUsage:   cpuUsage,
-			RAMUsage:   ramUsage,
-			CurrentVUs: currentVUs,
+			AgentToken:    cfg.AgentToken,
+			CPUUsage:      cpuUsage,
+			RAMUsage:      ramUsage,
+			CurrentVUs:    currentVUs,
+			RunningRunIDs: runningIDs,
 		}); err != nil {
 			log.Printf("[Heartbeat] failed: %v", err)
 		}
@@ -185,26 +187,4 @@ func getRAMPercent() float32 {
 	}
 	used := float64(mem.Used) / float64(mem.Total) * 100
 	return float32(used)
-}
-
-// recoverStaleRuns checks for runs that were active when the agent last exited.
-// Since all in-memory state is lost on restart, these runs are dead — notify master.
-func recoverStaleRuns(cfg *config.Config, masterClient *client.MasterClient) {
-	staleRunIDs := config.LoadActiveRuns()
-	if len(staleRunIDs) == 0 {
-		return
-	}
-
-	log.Printf("[Recovery] found %d stale run(s) from previous process: %v", len(staleRunIDs), staleRunIDs)
-
-	for _, runID := range staleRunIDs {
-		err := masterClient.NotifyFailed(runID, cfg.AgentID, cfg.AgentToken, "agent restarted — in-flight run lost")
-		if err != nil {
-			log.Printf("[Recovery] failed to notify master about stale run %s: %v", runID, err)
-		} else {
-			log.Printf("[Recovery] notified master that run %s failed due to restart", runID)
-		}
-	}
-
-	config.ClearActiveRuns()
 }

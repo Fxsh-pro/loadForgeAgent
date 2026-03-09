@@ -34,10 +34,11 @@ type AgentRegisterResponse struct {
 }
 
 type AgentHeartbeatRequest struct {
-	AgentToken string  `json:"agentToken"`
-	CPUUsage   float32 `json:"cpuUsage"`
-	RAMUsage   float32 `json:"ramUsage"`
-	CurrentVUs int     `json:"currentVus"`
+	AgentToken    string   `json:"agentToken"`
+	CPUUsage      float32  `json:"cpuUsage"`
+	RAMUsage      float32  `json:"ramUsage"`
+	CurrentVUs    int      `json:"currentVus"`
+	RunningRunIDs []string `json:"runningRunIds"`
 }
 
 type MetricPointRequest struct {

@@ -11,7 +11,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/loadforge/agent/config"
 	"github.com/loadforge/agent/engine"
 	"github.com/loadforge/agent/metrics"
 )
@@ -33,7 +32,6 @@ func (s *RunStore) Set(runID string, r *engine.Runner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.runners[runID] = r
-	s.persistRunIDs()
 }
 
 func (s *RunStore) Get(runID string) (*engine.Runner, bool) {
@@ -47,21 +45,17 @@ func (s *RunStore) Delete(runID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.runners, runID)
-	s.persistRunIDs()
 }
 
-// persistRunIDs writes the current set of active run IDs to disk.
-// Must be called with s.mu held.
-func (s *RunStore) persistRunIDs() {
+// RunningIDs returns the IDs of all currently active runs.
+func (s *RunStore) RunningIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	ids := make([]string, 0, len(s.runners))
 	for id := range s.runners {
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 {
-		config.ClearActiveRuns()
-	} else {
-		_ = config.SaveActiveRuns(ids)
-	}
+	return ids
 }
 
 // TotalActiveVUs returns the sum of active VUs across all running tasks.
