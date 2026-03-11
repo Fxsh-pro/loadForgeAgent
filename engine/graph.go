@@ -14,8 +14,27 @@ const (
 	NodeTypeHTTP     NodeType = "HTTP"
 	NodeTypeDelay    NodeType = "DELAY"
 	NodeTypeCheck    NodeType = "CHECK"
+	NodeTypeGenerate NodeType = "GENERATE"
 	NodeTypeTerminal NodeType = "TERMINAL"
 )
+
+type GenerateType string
+
+const (
+	GenerateTypeUUID         GenerateType = "UUID"
+	GenerateTypeEmail        GenerateType = "EMAIL"
+	GenerateTypeTimestamp    GenerateType = "TIMESTAMP"
+	GenerateTypeRandomInt    GenerateType = "RANDOM_INT"
+	GenerateTypeRandomString GenerateType = "RANDOM_STRING"
+)
+
+type GenerateRule struct {
+	Name   string       `json:"name"`
+	Type   GenerateType `json:"type"`
+	Min    *int64       `json:"min,omitempty"`
+	Max    *int64       `json:"max,omitempty"`
+	Length *int         `json:"length,omitempty"`
+}
 
 type NodeConfig struct {
 	Method  string            `json:"method"`
@@ -30,6 +49,7 @@ type ScenarioNode struct {
 	Name        string                  `json:"name"`
 	Config      NodeConfig              `json:"config"`
 	Extract     []extractor.ExtractRule `json:"extract"`
+	Generate    []GenerateRule          `json:"generate"`
 	ThinkTimeMs int64                   `json:"thinkTimeMs"`
 }
 

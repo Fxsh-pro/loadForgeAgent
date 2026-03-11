@@ -2,9 +2,12 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
+	mathrand "math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -110,6 +113,9 @@ func (v *VU) executeNode(ctx context.Context, node ScenarioNode, vuCtx map[strin
 	case NodeTypeCheck:
 		// no-op for MVP
 
+	case NodeTypeGenerate:
+		v.executeGenerate(node, vuCtx)
+
 	case NodeTypeTerminal:
 		// handled by the loop
 
@@ -178,4 +184,65 @@ func interpolate(s string, ctx map[string]string) string {
 // toExtractRules converts the engine's ExtractRule slice to the extractor package type.
 func toExtractRules(rules []extractor.ExtractRule) []extractor.ExtractRule {
 	return rules
+}
+
+// executeGenerate populates the VU context with generated values for each rule.
+func (v *VU) executeGenerate(node ScenarioNode, vuCtx map[string]string) {
+	for _, rule := range node.Generate {
+		vuCtx[rule.Name] = generateValue(rule)
+	}
+}
+
+func generateValue(rule GenerateRule) string {
+	switch rule.Type {
+	case GenerateTypeUUID:
+		return newUUID()
+	case GenerateTypeEmail:
+		return fmt.Sprintf("user_%s@gmail.com", randString(8))
+	case GenerateTypeTimestamp:
+		return fmt.Sprintf("%d", time.Now().UnixMilli())
+	case GenerateTypeRandomInt:
+		min := int64(0)
+		max := int64(1_000_000)
+		if rule.Min != nil {
+			min = *rule.Min
+		}
+		if rule.Max != nil {
+			max = *rule.Max
+		}
+		return fmt.Sprintf("%d", min+mathrand.Int63n(max-min+1))
+	case GenerateTypeRandomString:
+		length := 16
+		if rule.Length != nil {
+			length = *rule.Length
+		}
+		return randString(length)
+	default:
+		return ""
+	}
+}
+
+const randChars = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+func randString(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = randChars[mathrand.Intn(len(randChars))]
+	}
+	return string(b)
+}
+
+// newUUID generates a random UUID v4 without external dependencies.
+func newUUID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(b[0:4]),
+		hex.EncodeToString(b[4:6]),
+		hex.EncodeToString(b[6:8]),
+		hex.EncodeToString(b[8:10]),
+		hex.EncodeToString(b[10:]),
+	)
 }
