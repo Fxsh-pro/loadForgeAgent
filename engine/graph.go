@@ -36,6 +36,26 @@ type GenerateRule struct {
 	Length *int         `json:"length,omitempty"`
 }
 
+type CheckOp string
+
+const (
+	CheckOpEQ          CheckOp = "EQ"
+	CheckOpNE          CheckOp = "NE"
+	CheckOpLT          CheckOp = "LT"
+	CheckOpLE          CheckOp = "LE"
+	CheckOpGT          CheckOp = "GT"
+	CheckOpGE          CheckOp = "GE"
+	CheckOpContains    CheckOp = "CONTAINS"
+	CheckOpNotContains CheckOp = "NOT_CONTAINS"
+	CheckOpExists      CheckOp = "EXISTS"
+)
+
+type CheckRule struct {
+	Variable string  `json:"variable"`
+	Op       CheckOp `json:"op"`
+	Value    string  `json:"value,omitempty"`
+}
+
 type NodeConfig struct {
 	Method  string            `json:"method"`
 	URL     string            `json:"url"`
@@ -50,13 +70,23 @@ type ScenarioNode struct {
 	Config      NodeConfig              `json:"config"`
 	Extract     []extractor.ExtractRule `json:"extract"`
 	Generate    []GenerateRule          `json:"generate"`
+	Checks      []CheckRule             `json:"checks"`
 	ThinkTimeMs int64                   `json:"thinkTimeMs"`
 }
 
+type EdgeCondition string
+
+const (
+	EdgeConditionAny  EdgeCondition = "ANY"
+	EdgeConditionPass EdgeCondition = "PASS"
+	EdgeConditionFail EdgeCondition = "FAIL"
+)
+
 type ScenarioEdge struct {
-	From   int64   `json:"from"`
-	To     int64   `json:"to"`
-	Weight float64 `json:"weight"`
+	From      int64         `json:"from"`
+	To        int64         `json:"to"`
+	Weight    float64       `json:"weight"`
+	Condition EdgeCondition `json:"condition,omitempty"`
 }
 
 type ScenarioGraph struct {
@@ -66,31 +96,68 @@ type ScenarioGraph struct {
 	Edges           []ScenarioEdge          `json:"edges"`
 }
 
-// NextNode picks the next node ID from the current node using weighted random selection.
+// NextNode picks the next node ID using weighted random selection.
+// checkPassed is nil for non-check nodes (uses ANY edges).
+// For check nodes, conditional edges (PASS/FAIL) are matched first;
+// if none match, ANY edges are used as fallback.
 // Returns -1 if there are no outgoing edges (treat as terminal).
-func (g *ScenarioGraph) NextNode(currentID int64) (int64, error) {
-	var candidates []ScenarioEdge
+func (g *ScenarioGraph) NextNode(currentID int64, checkPassed *bool) (int64, error) {
+	var all []ScenarioEdge
 	for _, e := range g.Edges {
 		if e.From == currentID {
-			candidates = append(candidates, e)
+			all = append(all, e)
 		}
 	}
+	if len(all) == 0 {
+		return -1, nil
+	}
 
+	candidates := g.filterEdges(all, checkPassed)
 	if len(candidates) == 0 {
 		return -1, nil
 	}
 
-	r := rand.Float64()
-	cumulative := 0.0
-	for _, e := range candidates {
-		cumulative += e.Weight
-		if r <= cumulative {
-			return e.To, nil
+	return weightedPick(candidates), nil
+}
+
+// filterEdges selects edges matching the current check result.
+// Conditional (PASS/FAIL) edges take precedence; ANY edges are the fallback.
+func (g *ScenarioGraph) filterEdges(edges []ScenarioEdge, checkPassed *bool) []ScenarioEdge {
+	if checkPassed != nil {
+		want := EdgeConditionPass
+		if !*checkPassed {
+			want = EdgeConditionFail
+		}
+		var conditional []ScenarioEdge
+		for _, e := range edges {
+			if e.Condition == want {
+				conditional = append(conditional, e)
+			}
+		}
+		if len(conditional) > 0 {
+			return conditional
 		}
 	}
+	// Fall back to ANY edges (empty condition treated as ANY)
+	var any []ScenarioEdge
+	for _, e := range edges {
+		if e.Condition == EdgeConditionAny || e.Condition == "" {
+			any = append(any, e)
+		}
+	}
+	return any
+}
 
-	// Fallback: return last candidate (handles floating-point imprecision)
-	return candidates[len(candidates)-1].To, nil
+func weightedPick(edges []ScenarioEdge) int64 {
+	r := rand.Float64()
+	cumulative := 0.0
+	for _, e := range edges {
+		cumulative += e.Weight
+		if r <= cumulative {
+			return e.To
+		}
+	}
+	return edges[len(edges)-1].To
 }
 
 // GetNode retrieves a node by its ID.

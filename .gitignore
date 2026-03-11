@@ -1,0 +1,30 @@
+# Binary output
+loadforge-agent
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Coverage & profiling
+*.out
+*.prof
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Air live-reload
+tmp/
+
+# Build artifacts
+dist/
+bin/
+
+# macOS
+.DS_Store

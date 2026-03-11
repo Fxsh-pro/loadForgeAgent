@@ -9,6 +9,7 @@ import (
 	"log"
 	mathrand "math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,6 +58,7 @@ func (v *VU) run(ctx context.Context) {
 // walkGraph executes one full pass through the scenario graph from start to terminal.
 func (v *VU) walkGraph(ctx context.Context, vuCtx map[string]string) error {
 	currentID := v.graph.StartNodeID
+	var lastCheckPassed *bool
 
 	for {
 		select {
@@ -70,7 +72,12 @@ func (v *VU) walkGraph(ctx context.Context, vuCtx map[string]string) error {
 			return fmt.Errorf("get node %d: %w", currentID, err)
 		}
 
-		if err := v.executeNode(ctx, node, vuCtx); err != nil {
+		// Reset check result for non-check nodes so ANY edges are used
+		if node.Type != NodeTypeCheck {
+			lastCheckPassed = nil
+		}
+
+		if err := v.executeNode(ctx, node, vuCtx, &lastCheckPassed); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -81,7 +88,7 @@ func (v *VU) walkGraph(ctx context.Context, vuCtx map[string]string) error {
 			return nil
 		}
 
-		nextID, err := v.graph.NextNode(currentID)
+		nextID, err := v.graph.NextNode(currentID, lastCheckPassed)
 		if err != nil {
 			return fmt.Errorf("next node from %d: %w", currentID, err)
 		}
@@ -93,7 +100,7 @@ func (v *VU) walkGraph(ctx context.Context, vuCtx map[string]string) error {
 	}
 }
 
-func (v *VU) executeNode(ctx context.Context, node ScenarioNode, vuCtx map[string]string) error {
+func (v *VU) executeNode(ctx context.Context, node ScenarioNode, vuCtx map[string]string, checkPassed **bool) error {
 	switch node.Type {
 	case NodeTypeStart:
 		// no-op
@@ -111,7 +118,8 @@ func (v *VU) executeNode(ctx context.Context, node ScenarioNode, vuCtx map[strin
 		}
 
 	case NodeTypeCheck:
-		// no-op for MVP
+		passed := v.executeCheck(node, vuCtx)
+		*checkPassed = &passed
 
 	case NodeTypeGenerate:
 		v.executeGenerate(node, vuCtx)
@@ -165,12 +173,91 @@ func (v *VU) executeHTTP(ctx context.Context, node ScenarioNode, vuCtx map[strin
 
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
 	v.collector.Record(latencyMs, success)
-	//result := gjson.GetBytes(respBody, rule.Path)
-	//log.Printf("Response: %s", respBody)
+
+	// Auto-inject built-in variables so downstream Check nodes can reference them
+	// without requiring explicit extract rules on the HTTP node.
+	vuCtx["_status"] = fmt.Sprintf("%d", resp.StatusCode)
+	vuCtx["_latency_ms"] = fmt.Sprintf("%.0f", latencyMs)
+
 	rules := toExtractRules(node.Extract)
 	extractor.Apply(rules, respBody, resp.Header, vuCtx)
 
 	return nil
+}
+
+// executeCheck evaluates each check rule against the VU context.
+// Failed checks are recorded as errors in the metrics collector.
+// Returns true if all rules passed.
+func (v *VU) executeCheck(node ScenarioNode, vuCtx map[string]string) bool {
+	allPassed := true
+	for _, rule := range node.Checks {
+		passed := evalCheck(rule, vuCtx)
+		if !passed {
+			allPassed = false
+			v.collector.Record(0, false)
+			log.Printf("[VU %d] check FAILED: %s %s %q (got %q)",
+				v.id, rule.Variable, rule.Op, rule.Value, vuCtx[rule.Variable])
+		}
+	}
+	return allPassed
+}
+
+// evalCheck returns true if the rule passes.
+func evalCheck(rule CheckRule, vuCtx map[string]string) bool {
+	actual, exists := vuCtx[rule.Variable]
+
+	if rule.Op == CheckOpExists {
+		return exists && actual != ""
+	}
+	if !exists {
+		return false
+	}
+
+	switch rule.Op {
+	case CheckOpEQ:
+		return actual == rule.Value
+	case CheckOpNE:
+		return actual != rule.Value
+	case CheckOpContains:
+		return strings.Contains(actual, rule.Value)
+	case CheckOpNotContains:
+		return !strings.Contains(actual, rule.Value)
+	case CheckOpLT, CheckOpLE, CheckOpGT, CheckOpGE:
+		return evalNumericCheck(rule.Op, actual, rule.Value)
+	}
+	return false
+}
+
+// evalNumericCheck parses both sides as float64 and compares them.
+// Falls back to lexicographic comparison if parsing fails.
+func evalNumericCheck(op CheckOp, actual, expected string) bool {
+	a, errA := strconv.ParseFloat(actual, 64)
+	b, errB := strconv.ParseFloat(expected, 64)
+	if errA != nil || errB != nil {
+		// lexicographic fallback
+		switch op {
+		case CheckOpLT:
+			return actual < expected
+		case CheckOpLE:
+			return actual <= expected
+		case CheckOpGT:
+			return actual > expected
+		case CheckOpGE:
+			return actual >= expected
+		}
+		return false
+	}
+	switch op {
+	case CheckOpLT:
+		return a < b
+	case CheckOpLE:
+		return a <= b
+	case CheckOpGT:
+		return a > b
+	case CheckOpGE:
+		return a >= b
+	}
+	return false
 }
 
 // interpolate replaces ${key} placeholders in s with values from ctx.
